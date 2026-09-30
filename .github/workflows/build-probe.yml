@@ -6,7 +6,7 @@ on:
       probe_version:
         description: "Probe package version"
         required: true
-        default: "0.1.1"
+        default: "0.1.2"
         type: string
   push:
     branches: [main]
@@ -38,7 +38,7 @@ jobs:
         id: version
         shell: bash
         env:
-          INPUT_VERSION: ${{ inputs.probe_version || '0.1.1' }}
+          INPUT_VERSION: ${{ inputs.probe_version || '0.1.2' }}
         run: |
           set -euo pipefail
           VERSION="$INPUT_VERSION"
@@ -387,13 +387,11 @@ jobs:
           for pkg in out/*.ipkg; do
             echo "===== $pkg ====="
             tar -tzf "$pkg"
-            top="$(python3 - "$pkg" <<'PY'
-import sys, tarfile
-with tarfile.open(sys.argv[1], "r:gz") as tf:
-    first = tf.getmembers()[0].name
-    print(first.split("/", 1)[0])
-PY
-)"
+            case "$pkg" in
+              *bridge*) top="ikuai-cap-probe-bridge" ;;
+              *host*) top="ikuai-cap-probe-host" ;;
+              *) echo "Unknown package name: $pkg" >&2; exit 1 ;;
+            esac
             echo "-- manifest --"
             tar -xOzf "$pkg" "$top/manifest.json" | python3 -m json.tool
             echo "-- compose --"
