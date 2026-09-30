@@ -1,37 +1,42 @@
 # Ikuai4test
 
-Experimental iKuai 4.0 native-app packaging for Tailscale.
+Experimental iKuai 4.0 Tailscale packaging test.
 
-This repository builds upstream Tailscale as static Linux binaries and packages them as an iKuai 4.0 native `.ipkg` application.
+## Important finding
 
-> This is an experimental compatibility project. Test on a non-production router first.
+On the current iKuai 4.0 local-install path, `manifest.json` rejects native app `type: "0"` and reports that only Docker applications are supported.
+
+So this repository now uses a **Docker application package (`type: "1"`) for local installation**.
+
+This does **not** mean iKuai has no native applications. Public examples such as rtp2httpd use a native package type when distributed through the official App Market. The limitation found here is specifically the local-upload installer path on the tested firmware.
 
 ## Build
 
-Open **Actions → Build iKuai Tailscale IPKG → Run workflow**.
+Open **Actions → Build iKuai Tailscale Docker IPKG → Run workflow**.
 
-- `tailscale_ref=latest` resolves the latest stable Tailscale GitHub release.
+- `tailscale_ref=latest` resolves the latest stable Tailscale release.
 - You can also enter an explicit tag such as `v1.102.5`.
-- The workflow builds both `x86_64` and `aarch64` binaries with `CGO_ENABLED=0`.
-- It packages them as a native iKuai application with `manifest.json` `type: "0"`.
-- The workflow validates the generated tar/gzip package and uploads the `.ipkg` plus `SHA256SUMS` as a GitHub Actions artifact.
+- GitHub Actions builds `tailscale`, `tailscaled`, and `containerboot` from the upstream Tailscale source with `CGO_ENABLED=0`.
+- It builds an offline linux/amd64 Docker image and embeds it as `docker_image.tar.gz`.
+- The final package uses iKuai App Market Docker format with `manifest.json` `type: "1"`.
 
-## First-stage runtime test
+## First test target
 
-The package intentionally uses kernel TUN mode only:
+The Docker package requests:
 
-```
-tailscaled --tun=tailscale0
-```
+- `NET_ADMIN`
+- `NET_RAW`
+- TUN character-device permission (`c 10:200 rwm`)
+- persistent state under the app data directory
 
-The start script records whether `/dev/net/tun` exists and then starts `tailscaled`. If iKuai does not expose a usable TUN device or the app process lacks the required permission, the failure should appear in the application run log.
+The container starts Tailscale with `TS_USERSPACE=false`, so it will test whether iKuai's Docker app environment can actually provide `/dev/net/tun`.
 
-Configuration fields currently exposed by the iKuai app package:
+For the first install:
 
-- `TS_HOSTNAME`
-- `TS_AUTHKEY` (optional; use a disposable/revocable key while testing)
-- `TS_ACCEPT_DNS` (defaults to `0`)
+1. Use a disposable or revocable Tailscale auth key.
+2. Leave advertised routes empty.
+3. Leave extra arguments empty.
+4. Start the app and inspect its application/container logs.
+5. If it joins the tailnet, visit `http://<iKuai-LAN-IP>:41641/healthz`; a healthy node should return HTTP 200.
 
-State is stored under the application's own `app/data/tailscale` directory.
-
-The first build does **not** automatically enable subnet routing, exit-node mode, userspace-networking fallback, or firewall changes. Those should be added only after native execution and TUN support are confirmed.
+The initial Docker package uses iKuai's `doc_app_default` network, not host networking. Subnet routing, exit-node mode, and access to the iKuai host itself must be tested separately after basic TUN connectivity works.
