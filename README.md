@@ -2,41 +2,65 @@
 
 Experimental iKuai 4.0 Tailscale packaging test.
 
-## Important finding
+## Findings so far
 
-On the current iKuai 4.0 local-install path, `manifest.json` rejects native app `type: "0"` and reports that only Docker applications are supported.
+1. The iKuai 4.0 **local-install** path rejects native `type: "0"` packages and only accepts Docker applications (`type: "1"`).
+2. The Docker package can run Tailscale 1.102.5 in **kernel TUN mode** (`TS_USERSPACE=false`) and the node successfully joins the tailnet.
+3. iKuai Docker does not provide a reliable host-network path for this use case. Public rtp2httpd discussion explicitly calls out the lack of host mode on iKuai Docker, while iKuai's own Docker documentation exposes iKuai-managed container interfaces rather than host networking.
+4. Therefore the next useful experiment is **Subnet Router over the existing iKuai Docker bridge**, not another host-mode package.
 
-So this repository now uses a **Docker application package (`type: "1"`) for local installation**.
+## Current package revision
 
-This does **not** mean iKuai has no native applications. Public examples such as rtp2httpd use a native package type when distributed through the official App Market. The limitation found here is specifically the local-upload installer path on the tested firmware.
+The package version is now **1.102.5.2**:
+
+- upstream Tailscale version: `1.102.5`
+- iKuai package revision: `.2`
+
+Future package changes should increment the package revision instead of reusing the same version.
 
 ## Build
 
 Open **Actions → Build iKuai Tailscale Docker IPKG → Run workflow**.
 
 - `tailscale_ref=latest` resolves the latest stable Tailscale release.
-- You can also enter an explicit tag such as `v1.102.5`.
-- GitHub Actions builds `tailscale`, `tailscaled`, and `containerboot` from the upstream Tailscale source with `CGO_ENABLED=0`.
-- It builds an offline linux/amd64 Docker image and embeds it as `docker_image.tar.gz`.
+- GitHub Actions builds `tailscale`, `tailscaled`, and `containerboot` from upstream source with `CGO_ENABLED=0`.
+- The workflow builds an offline linux/amd64 Docker image and embeds it as `docker_image.tar.gz`.
 - The final package uses iKuai App Market Docker format with `manifest.json` `type: "1"`.
+- GitHub Actions dependencies are kept on their current major versions (checkout v7, setup-go v7, upload-artifact v7).
 
-## First test target
+## Stage 2: subnet-router test
 
-The Docker package requests:
+The package keeps:
 
 - `NET_ADMIN`
 - `NET_RAW`
 - TUN character-device permission (`c 10:200 rwm`)
-- persistent state under the app data directory
+- persistent Tailscale state
+- `TS_USERSPACE=false`
 
-The container starts Tailscale with `TS_USERSPACE=false`, so it will test whether iKuai's Docker app environment can actually provide `/dev/net/tun`.
+Set `TS_ROUTES` to the LAN CIDR you want to reach from the tailnet, for example:
 
-For the first install:
+```
+192.168.1.0/24
+```
 
-1. Use a disposable or revocable Tailscale auth key.
-2. Leave advertised routes empty.
-3. Leave extra arguments empty.
-4. Start the app and inspect its application/container logs.
-5. If it joins the tailnet, visit `http://<iKuai-LAN-IP>:41641/healthz`; a healthy node should return HTTP 200.
+Multiple routes can be comma-separated.
 
-The initial Docker package uses iKuai's `doc_app_default` network, not host networking. Subnet routing, exit-node mode, and access to the iKuai host itself must be tested separately after basic TUN connectivity works.
+When `TS_ROUTES` is non-empty, Tailscale's `containerboot` attempts to enable the required IP forwarding. After the node advertises the route, approve it in:
+
+**Tailscale Admin → Machines → ikuai → Edit route settings**
+
+Linux subnet-route SNAT is enabled by default, so LAN devices normally do not need an explicit return route to `100.64.0.0/10`.
+
+## Health / metrics
+
+The previous iKuai-LAN port mapping was removed because kernel-mode Tailscale and Docker host port publishing are not a reliable combination here.
+
+From another tailnet device, use the Tailscale IP directly:
+
+```
+http://<ikuai-tailscale-ip>:9002/healthz
+http://<ikuai-tailscale-ip>:9002/metrics
+```
+
+The current stage intentionally does not enable Exit Node mode and does not modify iKuai's own UPnP/NAT settings.
