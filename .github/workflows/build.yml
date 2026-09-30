@@ -20,7 +20,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       - name: Resolve Tailscale ref
         id: resolve
@@ -48,7 +48,7 @@ jobs:
           git -C tailscale-src checkout --detach FETCH_HEAD
 
       - name: Set up Go
-        uses: actions/setup-go@v6
+        uses: actions/setup-go@v7
         with:
           go-version-file: tailscale-src/go.mod
           cache-dependency-path: tailscale-src/go.sum
@@ -115,10 +115,14 @@ jobs:
           docker image inspect tailscale-ikuai:ikuai --format 'os={{.Os}} arch={{.Architecture}}'
 
       - name: Package iKuai Docker app
+        id: package
         env:
           VERSION: ${{ steps.version.outputs.short }}
+          PACKAGE_REVISION: "2"
         run: |
           set -euo pipefail
+          PACKAGE_VERSION="${VERSION}.${PACKAGE_REVISION}"
+          echo "package_version=$PACKAGE_VERSION" >> "$GITHUB_OUTPUT"
           STAGE="$GITHUB_WORKSPACE/work"
           PKG="$STAGE/tailscale"
           OUT="$GITHUB_WORKSPACE/out"
@@ -128,7 +132,7 @@ jobs:
           cat > "$PKG/manifest.json" <<EOF
           {
             "name": "tailscale",
-            "version": "$VERSION",
+            "version": "$PACKAGE_VERSION",
             "display_name": "Tailscale",
             "image": "tailscale-ikuai:ikuai",
             "description": "Tailscale mesh VPN for iKuai 4.0 (experimental Docker package)",
@@ -148,9 +152,7 @@ jobs:
           cat > "$PKG/app/.env" <<'EOF'
           CPUS_LIMIT=0
           MEMORY_LIMIT=0
-          HOST_IP=0.0.0.0
           RESTART=always
-          APP_PORT_HEALTH=41641
           TS_HOSTNAME=ikuai
           TS_AUTHKEY=
           TS_ROUTES=
@@ -177,8 +179,6 @@ jobs:
                 - NET_RAW
               device_cgroup_rules:
                 - 'c 10:200 rwm'
-              ports:
-                - ${HOST_IP}:${APP_PORT_HEALTH}:9002/tcp
               volumes:
                 - ./data/tailscale:/var/lib/tailscale
               environment:
@@ -191,6 +191,7 @@ jobs:
                 TS_ROUTES: ${TS_ROUTES}
                 TS_EXTRA_ARGS: ${TS_EXTRA_ARGS}
                 TS_ENABLE_HEALTH_CHECK: "true"
+                TS_ENABLE_METRICS: "true"
                 TS_LOCAL_ADDR_PORT: "0.0.0.0:9002"
               env_file:
                 - ./environment
@@ -211,17 +212,6 @@ jobs:
 
           cat > "$PKG/app/option.json" <<'EOF'
           [
-            {
-              "default": 41641,
-              "attrname": "APP_PORT_HEALTH",
-              "label": {"en": "Health port", "zh": "健康检查端口"},
-              "required": true,
-              "scope": "config",
-              "type": "integer",
-              "min": 1,
-              "max": 65535,
-              "description": {"zh": "连接成功后访问 http://爱快IP:端口/healthz，应返回 HTTP 200。"}
-            },
             {
               "default": "ikuai",
               "attrname": "TS_HOSTNAME",
@@ -252,7 +242,7 @@ jobs:
               "type": "text",
               "min": 0,
               "max": 512,
-              "description": {"zh": "第一轮建议留空；后续可填写 192.168.1.0/24 等。"}
+              "description": {"zh": "填写需要从 Tailnet 访问的 iKuai LAN 网段，例如 192.168.1.0/24；多个网段用逗号分隔。启用后还需在 Tailscale 管理后台批准路由。"}
             },
             {
               "default": "",
@@ -268,31 +258,43 @@ jobs:
           EOF
 
           cat > "$PKG/readme" <<'EOF'
-          【实验性 Docker 应用】
+          【实验性 Docker 应用 / Subnet Router 阶段】
 
-          iKuai 4.0 当前“本地安装”入口只接受 Docker 类型应用，因此本包使用 type=1。
-          Docker 镜像不是直接引用公共镜像，而是在 GitHub Actions 中从 Tailscale 官方源码编译后打入 ipkg。
+          已验证：iKuai 4.0 应用市场 Docker 环境可运行 Tailscale 1.102.5 的 kernel TUN 模式，
+          节点可以正常加入 Tailnet。
 
-          第一轮建议只填写一次性/可撤销 TS_AUTHKEY，TS_ROUTES 与 TS_EXTRA_ARGS 留空。
+          iKuai 的 Docker 实现没有可靠的 host network 路线；本包继续使用 doc_app_default bridge，
+          下一阶段专门验证 Tailscale Subnet Router 能否经 172.18.20.1 转发到 iKuai LAN。
 
-          本包申请 NET_ADMIN、NET_RAW，并通过 device_cgroup_rules 开放 TUN 字符设备。
-          容器启动时会尝试创建 /dev/net/tun，然后以 TS_USERSPACE=false 运行官方 containerboot。
+          配置：
+          - TS_AUTHKEY：首次注册可填写；已有持久状态时可留空。
+          - TS_ROUTES：填写需要从 Tailnet 访问的 LAN CIDR，例如 192.168.1.0/24。
+            多个网段用逗号分隔。
+          - TS_EXTRA_ARGS：第一轮保持为空。
 
-          登录 Tailnet 成功后：
-          http://<爱快 LAN IP>:41641/healthz
-          应返回 HTTP 200。
+          当 TS_ROUTES 非空时，Tailscale containerboot 会自动尝试开启对应 IP forwarding。
+          Linux 的 subnet-route SNAT 默认开启，因此 LAN 设备通常不需要增加 100.64.0.0/10 回程路由。
 
-          当前使用 iKuai 的 doc_app_default 网络，不使用 host 网络。
-          Subnet Router、Exit Node、访问 iKuai 宿主本身等能力需要后续分别验证。
+          路由发布后，还必须到 Tailscale 管理后台：
+          Machines -> ikuai -> Edit route settings
+          批准对应 Subnet Route。
+
+          健康检查不再映射到 iKuai LAN 端口。
+          请从另一台 Tailnet 设备直接访问：
+          http://<ikuai 的 Tailscale IPv4>:9002/healthz
+          http://<ikuai 的 Tailscale IPv4>:9002/metrics
+
+          当前不启用 Exit Node，也不修改 iKuai 自身 NAT/UPnP 配置。
           EOF
 
           cat > "$PKG/changelog" <<EOF
-          $VERSION
-          - Switch local install to Docker application type=1.
-          - Build tailscale, tailscaled and containerboot from upstream source.
-          - Embed offline linux/amd64 Docker image.
-          - Request NET_ADMIN/NET_RAW and TUN character-device access.
-          - Persistent state and health endpoint.
+          $PACKAGE_VERSION
+          - Stage 2: test subnet routing through iKuai's doc_app_default bridge network.
+          - Remove broken/irrelevant host port publishing for kernel-mode Tailscale.
+          - Keep kernel TUN mode with NET_ADMIN/NET_RAW and TUN device permission.
+          - Enable Tailscale health and metrics on port 9002 inside the Tailnet.
+          - Keep TS_ROUTES configurable; containerboot enables IP forwarding when routes are advertised.
+          - Update GitHub Actions to current major versions.
           EOF
 
           docker save tailscale-ikuai:ikuai | gzip -9 > "$PKG/docker_image.tar.gz"
@@ -323,7 +325,10 @@ jobs:
           python3 -m json.tool "$PKG/manifest.json" >/dev/null
           python3 -m json.tool "$PKG/app/option.json" >/dev/null
 
-          package="$OUT/tailscale-${VERSION}-ikuai-docker.ipkg"
+          echo "== docker compose validation =="
+          (cd "$PKG/app" && docker compose --env-file .env -f docker-compose.yaml config >/dev/null)
+
+          package="$OUT/tailscale-${PACKAGE_VERSION}-ikuai-docker.ipkg"
           (cd "$STAGE" && tar -czf "$package" tailscale/)
           gzip -t "$package"
           tar -tzf "$package" >/dev/null
@@ -335,19 +340,19 @@ jobs:
 
       - name: Inspect package
         env:
-          VERSION: ${{ steps.version.outputs.short }}
+          PACKAGE_VERSION: ${{ steps.package.outputs.package_version }}
         run: |
           set -euo pipefail
-          pkg="out/tailscale-$VERSION-ikuai-docker.ipkg"
+          pkg="out/tailscale-$PACKAGE_VERSION-ikuai-docker.ipkg"
           tar -tzf "$pkg"
           tar -xOzf "$pkg" tailscale/manifest.json | python3 -m json.tool
           echo "== docker-compose.yaml =="
           tar -xOzf "$pkg" tailscale/app/docker-compose.yaml
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
-          name: tailscale-${{ steps.version.outputs.short }}-ikuai-docker
+          name: tailscale-${{ steps.package.outputs.package_version }}-ikuai-docker
           path: |
             out/*.ipkg
             out/SHA256SUMS
