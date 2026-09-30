@@ -1,18 +1,16 @@
-name: Build iKuai Tailscale IPKG
+name: Build iKuai Tailscale Docker IPKG
 
 on:
   workflow_dispatch:
     inputs:
       tailscale_ref:
-        description: "Tailscale Git ref/tag. Use 'latest' for the latest stable release."
+        description: "Tailscale Git ref/tag. Use 'latest' for latest stable."
         required: true
         default: "latest"
         type: string
   push:
-    branches:
-      - main
-    paths:
-      - ".github/workflows/build.yml"
+    branches: [main]
+    paths: [".github/workflows/build.yml"]
 
 permissions:
   contents: read
@@ -21,43 +19,33 @@ jobs:
   build:
     runs-on: ubuntu-latest
     timeout-minutes: 45
-
     steps:
-      - name: Checkout
-        uses: actions/checkout@v5
+      - uses: actions/checkout@v5
 
       - name: Resolve Tailscale ref
         id: resolve
         shell: bash
         env:
-          REQUESTED_REF: ${{ inputs.tailscale_ref || 'latest' }}
+          REQUESTED_REF: $${{ inputs.tailscale_ref || 'latest' }}
         run: |
           set -euo pipefail
           if [[ "$REQUESTED_REF" == "latest" ]]; then
-            TS_REF="$(
-              curl -fsSL \
-                -H 'Accept: application/vnd.github+json' \
-                -H 'X-GitHub-Api-Version: 2022-11-28' \
-                https://api.github.com/repos/tailscale/tailscale/releases/latest |
-              python3 -c 'import json,sys; print(json.load(sys.stdin)["tag_name"])'
-            )"
+            TS_REF="$(curl -fsSL https://api.github.com/repos/tailscale/tailscale/releases/latest | python3 -c 'import json,sys; print(json.load(sys.stdin)["tag_name"])')"
           else
             TS_REF="$REQUESTED_REF"
           fi
           echo "ref=$TS_REF" >> "$GITHUB_OUTPUT"
-          echo "Resolved Tailscale ref: $TS_REF"
+          echo "Resolved: $TS_REF"
 
       - name: Fetch upstream Tailscale
-        shell: bash
         env:
-          TS_REF: ${{ steps.resolve.outputs.ref }}
+          TS_REF: $${{ steps.resolve.outputs.ref }}
         run: |
           set -euo pipefail
           git init tailscale-src
           git -C tailscale-src remote add origin https://github.com/tailscale/tailscale.git
           git -C tailscale-src fetch --depth=1 origin "$TS_REF"
           git -C tailscale-src checkout --detach FETCH_HEAD
-          git -C tailscale-src rev-parse HEAD
 
       - name: Set up Go
         uses: actions/setup-go@v6
@@ -65,123 +53,179 @@ jobs:
           go-version-file: tailscale-src/go.mod
           cache-dependency-path: tailscale-src/go.sum
 
-      - name: Detect Tailscale version
+      - name: Detect version
         id: version
-        shell: bash
         run: |
           set -euo pipefail
           vars="$(cd tailscale-src && ./build_dist.sh shellvars)"
           version="$(printf '%s\n' "$vars" | sed -n 's/^VERSION_SHORT="\([^"]*\)"$/\1/p')"
-          if [[ -z "$version" ]]; then
-            echo "Could not parse VERSION_SHORT:" >&2
-            printf '%s\n' "$vars" >&2
-            exit 1
-          fi
+          test -n "$version"
           echo "short=$version" >> "$GITHUB_OUTPUT"
           echo "Tailscale version: $version"
-          go version
 
-      - name: Build static Linux binaries
-        shell: bash
+      - name: Build Tailscale linux/amd64
         run: |
           set -euo pipefail
-          for spec in "amd64:x86_64" "arm64:aarch64"; do
-            goarch="${spec%%:*}"
-            ikuai_arch="${spec##*:}"
-            out="$GITHUB_WORKSPACE/dist/$ikuai_arch"
-            mkdir -p "$out"
+          mkdir -p dist
+          (
+            cd tailscale-src
+            CGO_ENABLED=0 GOOS=linux GOARCH=amd64 ./build_dist.sh --strip -o "$GITHUB_WORKSPACE/dist/tailscale" ./cmd/tailscale
+            CGO_ENABLED=0 GOOS=linux GOARCH=amd64 ./build_dist.sh --strip -o "$GITHUB_WORKSPACE/dist/tailscaled" ./cmd/tailscaled
+            CGO_ENABLED=0 GOOS=linux GOARCH=amd64 ./build_dist.sh --strip -o "$GITHUB_WORKSPACE/dist/containerboot" ./cmd/containerboot
+          )
+          file dist/tailscale dist/tailscaled dist/containerboot
 
-            echo "::group::linux/$goarch -> $ikuai_arch"
-            (
-              cd tailscale-src
-              CGO_ENABLED=0 GOOS=linux GOARCH="$goarch" \
-                ./build_dist.sh --strip \
-                -o "$out/tailscale" ./cmd/tailscale
-
-              CGO_ENABLED=0 GOOS=linux GOARCH="$goarch" \
-                ./build_dist.sh --strip \
-                -o "$out/tailscaled" ./cmd/tailscaled
-            )
-            echo "::endgroup::"
-          done
-
-      - name: Verify binaries
-        shell: bash
-        run: |
-          set -euo pipefail
-          for arch in x86_64 aarch64; do
-            echo "== $arch =="
-            file "dist/$arch/tailscale"
-            file "dist/$arch/tailscaled"
-            go version -m "dist/$arch/tailscale" | head -n 20
-          done
-
-      - name: Build iKuai native ipkg
-        id: package
-        shell: bash
+      - name: Build offline Docker image
         env:
-          VERSION: ${{ steps.version.outputs.short }}
+          VERSION: $${{ steps.version.outputs.short }}
         run: |
           set -euo pipefail
+          mkdir -p image
+          cp dist/tailscale dist/tailscaled dist/containerboot image/
 
-          ROOT="$GITHUB_WORKSPACE"
-          STAGE="$ROOT/work"
+          cat > image/entrypoint.sh <<'EOS'
+          #!/bin/sh
+          set -eu
+          mkdir -p /dev/net
+          if [ ! -c /dev/net/tun ]; then
+            mknod /dev/net/tun c 10 200 2>/dev/null || true
+          fi
+          if [ -c /dev/net/tun ]; then
+            echo "[ikuai-tailscale] /dev/net/tun available"
+          else
+            echo "[ikuai-tailscale] /dev/net/tun unavailable"
+          fi
+          exec /usr/local/bin/containerboot
+          EOS
+          chmod 0755 image/entrypoint.sh
+
+          cat > image/Dockerfile <<'EOF'
+          FROM alpine:3.22
+          RUN apk add --no-cache ca-certificates iproute2 iptables ip6tables \
+           && rm -f /usr/sbin/iptables /usr/sbin/ip6tables \
+           && ln -s /usr/sbin/iptables-legacy /usr/sbin/iptables \
+           && ln -s /usr/sbin/ip6tables-legacy /usr/sbin/ip6tables
+          COPY tailscale tailscaled containerboot /usr/local/bin/
+          COPY entrypoint.sh /usr/local/bin/ikuai-tailscale-entrypoint
+          RUN chmod 0755 /usr/local/bin/tailscale /usr/local/bin/tailscaled /usr/local/bin/containerboot /usr/local/bin/ikuai-tailscale-entrypoint
+          ENTRYPOINT ["/usr/local/bin/ikuai-tailscale-entrypoint"]
+          EOF
+
+          docker build --platform linux/amd64 -t tailscale-ikuai:ikuai image
+          docker image inspect tailscale-ikuai:ikuai --format 'os={{.Os}} arch={{.Architecture}}'
+
+      - name: Package iKuai Docker app
+        env:
+          VERSION: $${{ steps.version.outputs.short }}
+        run: |
+          set -euo pipefail
+          STAGE="$GITHUB_WORKSPACE/work"
           PKG="$STAGE/tailscale"
-          OUT="$ROOT/out"
-
+          OUT="$GITHUB_WORKSPACE/out"
           rm -rf "$STAGE" "$OUT"
-          mkdir -p \
-            "$PKG/app/bin" \
-            "$PKG/app/data" \
-            "$PKG/app/run" \
-            "$PKG/log" \
-            "$PKG/scripts" \
-            "$PKG/ui/ico" \
-            "$OUT"
-
-          for arch in x86_64 aarch64; do
-            install -m 0755 "$ROOT/dist/$arch/tailscale" "$PKG/app/bin/tailscale-$arch"
-            install -m 0755 "$ROOT/dist/$arch/tailscaled" "$PKG/app/bin/tailscaled-$arch"
-          done
+          mkdir -p "$PKG/app/data/tailscale" "$PKG/ui/ico" "$OUT"
 
           cat > "$PKG/manifest.json" <<EOF
           {
             "name": "tailscale",
             "version": "$VERSION",
             "display_name": "Tailscale",
-            "description": "Tailscale mesh VPN native application for iKuai 4.0 (experimental)",
-            "type": "0",
+            "image": "tailscale-ikuai:ikuai",
+            "description": "Tailscale mesh VPN for iKuai 4.0 (experimental Docker package)",
+            "type": "1",
             "maintainer": "Bigzhangbig",
             "maintainer_url": "https://github.com/Bigzhangbig/Ikuai4test",
             "distributor": "Bigzhangbig",
             "distributor_url": "https://github.com/Bigzhangbig/Ikuai4test",
             "requirements": {
               "memory": "128MB",
-              "storage": "128MB",
-              "os_min_version": "4.0.304"
+              "storage": "160MB",
+              "os_min_version": "4.0.0"
             }
           }
           EOF
 
           cat > "$PKG/app/.env" <<'EOF'
+          CPUS_LIMIT=0
+          MEMORY_LIMIT=0
+          HOST_IP=0.0.0.0
+          RESTART=always
+          APP_PORT_HEALTH=41641
           TS_HOSTNAME=ikuai
           TS_AUTHKEY=
-          TS_ACCEPT_DNS=0
+          TS_ROUTES=
+          TS_EXTRA_ARGS=
           EOF
 
           cat > "$PKG/app/environment" <<'EOF'
-          # Reserved for runtime environment variables.
+          # Reserved for future advanced environment variables.
+          EOF
+
+          cat > "$PKG/app/docker-compose.yaml" <<'EOF'
+          services:
+            tailscale:
+              image: tailscale-ikuai:ikuai
+              container_name: tailscale-${NAME_NONCE}
+              deploy:
+                resources:
+                  limits:
+                    cpus: ${CPUS_LIMIT}
+                    memory: ${MEMORY_LIMIT}
+              restart: ${RESTART}
+              cap_add:
+                - NET_ADMIN
+                - NET_RAW
+              device_cgroup_rules:
+                - 'c 10:200 rwm'
+              ports:
+                - ${HOST_IP}:${APP_PORT_HEALTH}:9002/tcp
+              volumes:
+                - ./data/tailscale:/var/lib/tailscale
+              environment:
+                TS_AUTHKEY: ${TS_AUTHKEY}
+                TS_HOSTNAME: ${TS_HOSTNAME}
+                TS_STATE_DIR: /var/lib/tailscale
+                TS_USERSPACE: "false"
+                TS_ACCEPT_DNS: "false"
+                TS_AUTH_ONCE: "true"
+                TS_ROUTES: ${TS_ROUTES}
+                TS_EXTRA_ARGS: ${TS_EXTRA_ARGS}
+                TS_ENABLE_HEALTH_CHECK: "true"
+                TS_LOCAL_ADDR_PORT: "0.0.0.0:9002"
+              env_file:
+                - ./environment
+              logging:
+                driver: "json-file"
+                options:
+                  max-size: "10m"
+                  max-file: "3"
+              networks:
+                - doc_app_default
+              labels:
+                createdBy: "Tailscale"
+          networks:
+            doc_app_default:
+              external: true
+              name: doc_app_default
           EOF
 
           cat > "$PKG/app/option.json" <<'EOF'
           [
             {
+              "default": 41641,
+              "attrname": "APP_PORT_HEALTH",
+              "label": {"en": "Health port", "zh": "健康检查端口"},
+              "required": true,
+              "scope": "config",
+              "type": "integer",
+              "min": 1,
+              "max": 65535,
+              "description": {"zh": "连接成功后访问 http://爱快IP:端口/healthz，应返回 HTTP 200。"}
+            },
+            {
               "default": "ikuai",
               "attrname": "TS_HOSTNAME",
-              "label": {
-                "en": "Tailscale hostname",
-                "zh": "Tailscale 设备名"
-              },
+              "label": {"en": "Tailscale hostname", "zh": "Tailscale 设备名"},
               "required": true,
               "scope": "config",
               "type": "text",
@@ -191,338 +235,119 @@ jobs:
             {
               "default": "",
               "attrname": "TS_AUTHKEY",
-              "label": {
-                "en": "Tailscale auth key",
-                "zh": "Tailscale Auth Key"
-              },
+              "label": {"en": "Tailscale auth key", "zh": "Tailscale Auth Key"},
               "required": false,
               "scope": "config",
               "type": "password",
               "min": 0,
               "max": 256,
-              "description": {
-                "zh": "建议测试时使用一次性或可撤销的 Auth Key；留空则只启动 tailscaled。"
-              }
+              "description": {"zh": "测试阶段建议使用一次性或可撤销 Auth Key。"}
             },
             {
-              "default": 0,
-              "attrname": "TS_ACCEPT_DNS",
-              "label": {
-                "en": "Accept Tailscale DNS (0/1)",
-                "zh": "接受 Tailscale DNS（0/1）"
-              },
-              "required": true,
+              "default": "",
+              "attrname": "TS_ROUTES",
+              "label": {"en": "Advertise routes", "zh": "发布子网路由"},
+              "required": false,
               "scope": "config",
-              "type": "integer",
+              "type": "text",
               "min": 0,
-              "max": 1
+              "max": 512,
+              "description": {"zh": "第一轮建议留空；后续可填写 192.168.1.0/24 等。"}
+            },
+            {
+              "default": "",
+              "attrname": "TS_EXTRA_ARGS",
+              "label": {"en": "Extra up args", "zh": "额外 tailscale up 参数"},
+              "required": false,
+              "scope": "config",
+              "type": "text",
+              "min": 0,
+              "max": 1024
             }
           ]
           EOF
 
           cat > "$PKG/readme" <<'EOF'
-          【实验性应用】
+          【实验性 Docker 应用】
 
-          本包用于验证 iKuai 4.0 原生应用运行 Tailscale 的可行性。
+          iKuai 4.0 当前“本地安装”入口只接受 Docker 类型应用，因此本包使用 type=1。
+          Docker 镜像不是直接引用公共镜像，而是在 GitHub Actions 中从 Tailscale 官方源码编译后打入 ipkg。
 
-          当前阶段：
-          1. 使用官方 Tailscale 源码编译静态 linux/amd64 与 linux/arm64 二进制。
-          2. 直接启动 tailscaled --tun=tailscale0，以实际运行结果验证 /dev/net/tun 与权限。
-          3. 状态数据保存在应用目录 app/data/tailscale 下。
-          4. 如果填写 TS_AUTHKEY，会自动执行 tailscale up。
-          5. 默认 TS_ACCEPT_DNS=0，避免测试阶段修改 iKuai DNS 行为。
+          第一轮建议只填写一次性/可撤销 TS_AUTHKEY，TS_ROUTES 与 TS_EXTRA_ARGS 留空。
 
-          当前不会自动开启 Subnet Router、Exit Node，也不会主动修改 iKuai 防火墙。
+          本包申请 NET_ADMIN、NET_RAW，并通过 device_cgroup_rules 开放 TUN 字符设备。
+          容器启动时会尝试创建 /dev/net/tun，然后以 TS_USERSPACE=false 运行官方 containerboot。
 
-          请在非生产设备上测试；启动结果请查看应用日志。
+          登录 Tailnet 成功后：
+          http://<爱快 LAN IP>:41641/healthz
+          应返回 HTTP 200。
+
+          当前使用 iKuai 的 doc_app_default 网络，不使用 host 网络。
+          Subnet Router、Exit Node、访问 iKuai 宿主本身等能力需要后续分别验证。
           EOF
 
           cat > "$PKG/changelog" <<EOF
           $VERSION
-          - Initial experimental iKuai 4.0 native Tailscale package.
-          - Static x86_64 and aarch64 Tailscale binaries.
-          - Kernel TUN mode only; no userspace fallback in this test build.
+          - Switch local install to Docker application type=1.
+          - Build tailscale, tailscaled and containerboot from upstream source.
+          - Embed offline linux/amd64 Docker image.
+          - Request NET_ADMIN/NET_RAW and TUN character-device access.
+          - Persistent state and health endpoint.
           EOF
 
-          cat > "$PKG/scripts/start.sh" <<'EOS'
-          #!/bin/sh
-          set -eu
-
-          SCRIPT_DIR=$(CDPATH= cd "$(dirname "$0")" && pwd)
-          PKG_DIR=$(dirname "$SCRIPT_DIR")
-          BIN_DIR="$PKG_DIR/app/bin"
-          DATA_DIR="$PKG_DIR/app/data"
-          STATE_DIR="$DATA_DIR/tailscale"
-          RUN_DIR="$PKG_DIR/app/run"
-          SOCKET="$RUN_DIR/tailscaled.sock"
-          PIDFILE="$RUN_DIR/tailscaled.pid"
-          RUN_LOG="$PKG_DIR/log/run.log"
-          CONFIG_ENV="$PKG_DIR/app/.env"
-          RUNTIME_ENV="$PKG_DIR/app/environment"
-
-          log() {
-              mkdir -p "$PKG_DIR/log"
-              printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >> "$RUN_LOG"
-          }
-
-          CR=$(printf '\r')
-          load_env_file() {
-              [ -f "$1" ] || return 0
-              while IFS= read -r line || [ -n "$line" ]; do
-                  line=${line%"$CR"}
-                  case "$line" in
-                      ''|'#'*) continue ;;
-                      *=*) ;;
-                      *) continue ;;
-                  esac
-                  key=${line%%=*}
-                  value=${line#*=}
-                  case "$key" in
-                      ''|*[!A-Za-z0-9_]*) continue ;;
-                  esac
-                  export "$key=$value"
-              done < "$1"
-          }
-
-          case "$(uname -m 2>/dev/null || true)" in
-              x86_64|amd64) ARCH=x86_64 ;;
-              aarch64|arm64) ARCH=aarch64 ;;
-              *)
-                  log "Unsupported architecture: $(uname -m 2>/dev/null || echo unknown)"
-                  exit 1
-                  ;;
-          esac
-
-          TAILSCALE="$BIN_DIR/tailscale-$ARCH"
-          TAILSCALED="$BIN_DIR/tailscaled-$ARCH"
-
-          mkdir -p "$STATE_DIR" "$RUN_DIR" "$PKG_DIR/log"
-          load_env_file "$CONFIG_ENV"
-          load_env_file "$RUNTIME_ENV"
-
-          : "${TS_HOSTNAME:=ikuai}"
-          : "${TS_AUTHKEY:=}"
-          : "${TS_ACCEPT_DNS:=0}"
-
-          if [ ! -x "$TAILSCALE" ] || [ ! -x "$TAILSCALED" ]; then
-              log "Tailscale binaries are missing for architecture $ARCH"
-              exit 1
-          fi
-
-          if [ -e /dev/net/tun ]; then
-              log "/dev/net/tun exists"
-          else
-              log "/dev/net/tun does NOT exist; tailscaled is expected to fail in kernel TUN mode"
-          fi
-
-          if [ -r /proc/sys/net/ipv4/ip_forward ]; then
-              log "IPv4 forwarding=$(cat /proc/sys/net/ipv4/ip_forward 2>/dev/null || echo unknown)"
-          fi
-
-          if [ -f "$PIDFILE" ]; then
-              old_pid=$(cat "$PIDFILE" 2>/dev/null || true)
-              if [ -n "$old_pid" ] && kill -0 "$old_pid" 2>/dev/null; then
-                  log "tailscaled already running, pid=$old_pid"
-                  exit 0
-              fi
-              rm -f "$PIDFILE"
-          fi
-
-          rm -f "$SOCKET"
-          export HOME="$DATA_DIR"
-
-          log "Starting tailscaled in kernel TUN mode"
-          "$TAILSCALED" \
-              --statedir="$STATE_DIR" \
-              --socket="$SOCKET" \
-              --tun=tailscale0 \
-              >> "$RUN_LOG" 2>&1 &
-          pid=$!
-          printf '%s\n' "$pid" > "$PIDFILE"
-
-          n=0
-          while [ ! -S "$SOCKET" ]; do
-              if ! kill -0 "$pid" 2>/dev/null; then
-                  log "tailscaled exited before creating its socket; inspect the log above"
-                  rm -f "$PIDFILE"
-                  exit 1
-              fi
-              n=$((n + 1))
-              if [ "$n" -ge 20 ]; then
-                  log "Timed out waiting for tailscaled socket"
-                  exit 1
-              fi
-              sleep 1
-          done
-
-          log "tailscaled socket ready: $SOCKET"
-
-          if [ -n "$TS_AUTHKEY" ]; then
-              accept_dns=false
-              [ "$TS_ACCEPT_DNS" = "1" ] && accept_dns=true
-              log "Auth key configured; running tailscale up for hostname=$TS_HOSTNAME"
-              if "$TAILSCALE" \
-                  --socket="$SOCKET" \
-                  up \
-                  --auth-key="$TS_AUTHKEY" \
-                  --hostname="$TS_HOSTNAME" \
-                  --accept-dns="$accept_dns" \
-                  >> "$RUN_LOG" 2>&1; then
-                  log "tailscale up completed"
-              else
-                  log "tailscale up failed; tailscaled remains running"
-              fi
-          else
-              log "TS_AUTHKEY is empty; tailscaled started without automatic login"
-          fi
-
-          exit 0
-          EOS
-
-          cat > "$PKG/scripts/stop.sh" <<'EOS'
-          #!/bin/sh
-          set -u
-
-          SCRIPT_DIR=$(CDPATH= cd "$(dirname "$0")" && pwd)
-          PKG_DIR=$(dirname "$SCRIPT_DIR")
-          RUN_DIR="$PKG_DIR/app/run"
-          PIDFILE="$RUN_DIR/tailscaled.pid"
-          RUN_LOG="$PKG_DIR/log/run.log"
-
-          log() {
-              mkdir -p "$PKG_DIR/log"
-              printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >> "$RUN_LOG"
-          }
-
-          if [ -f "$PIDFILE" ]; then
-              pid=$(cat "$PIDFILE" 2>/dev/null || true)
-              if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
-                  log "Stopping tailscaled, pid=$pid"
-                  kill "$pid" 2>/dev/null || true
-                  n=0
-                  while kill -0 "$pid" 2>/dev/null; do
-                      n=$((n + 1))
-                      if [ "$n" -ge 10 ]; then
-                          kill -9 "$pid" 2>/dev/null || true
-                          break
-                      fi
-                      sleep 1
-                  done
-              fi
-              rm -f "$PIDFILE"
-          fi
-
-          rm -f "$RUN_DIR/tailscaled.sock"
-          log "Tailscale application stopped"
-          exit 0
-          EOS
-
-          cat > "$PKG/scripts/PRE_INST.sh" <<'EOS'
-          #!/bin/sh
-          set -eu
-          SCRIPT_DIR=$(CDPATH= cd "$(dirname "$0")" && pwd)
-          PKG_DIR=$(dirname "$SCRIPT_DIR")
-          mkdir -p "$PKG_DIR/app/data" "$PKG_DIR/app/run" "$PKG_DIR/log"
-          chmod 755 "$PKG_DIR"/app/bin/* "$PKG_DIR"/scripts/*.sh
-          EOS
-
-          cat > "$PKG/scripts/POST_INST.sh" <<'EOS'
-          #!/bin/sh
-          set -eu
-          SCRIPT_DIR=$(CDPATH= cd "$(dirname "$0")" && pwd)
-          PKG_DIR=$(dirname "$SCRIPT_DIR")
-          mkdir -p "$PKG_DIR/app/data" "$PKG_DIR/app/run" "$PKG_DIR/log"
-          chmod 755 "$PKG_DIR"/app/bin/* "$PKG_DIR"/scripts/*.sh
-          EOS
-
-          cat > "$PKG/scripts/PRE_UNINST.sh" <<'EOS'
-          #!/bin/sh
-          set -u
-          SCRIPT_DIR=$(CDPATH= cd "$(dirname "$0")" && pwd)
-          PKG_DIR=$(dirname "$SCRIPT_DIR")
-          "$PKG_DIR/scripts/stop.sh" || true
-          EOS
-
-          cat > "$PKG/scripts/POST_UNINST.sh" <<'EOS'
-          #!/bin/sh
-          set -u
-          SCRIPT_DIR=$(CDPATH= cd "$(dirname "$0")" && pwd)
-          PKG_DIR=$(dirname "$SCRIPT_DIR")
-          rm -f "$PKG_DIR/app/run/tailscaled.pid" "$PKG_DIR/app/run/tailscaled.sock"
-          EOS
-
-          chmod 0755 "$PKG/scripts/"*.sh "$PKG/app/bin/"*
+          docker save tailscale-ikuai:ikuai | gzip -9 > "$PKG/docker_image.tar.gz"
 
           python3 - "$PKG/ui/ico/app.png" <<'PY'
-          import binascii
-          import struct
-          import sys
-          import zlib
-
-          w = h = 256
-
-          def chunk(kind, data):
-              return (
-                  struct.pack(">I", len(data))
-                  + kind
-                  + data
-                  + struct.pack(">I", binascii.crc32(kind + data) & 0xFFFFFFFF)
-              )
-
-          rows = []
+          import binascii, struct, sys, zlib
+          w=h=256
+          def chunk(k,d):
+              return struct.pack(">I",len(d))+k+d+struct.pack(">I",binascii.crc32(k+d)&0xffffffff)
+          rows=[]
           for y in range(h):
-              row = bytearray([0])
+              row=bytearray([0])
               for x in range(w):
-                  rgba = [34, 40, 49, 255]
-                  for cx in (72, 128, 184):
-                      for cy in (72, 128, 184):
-                          if (x - cx) ** 2 + (y - cy) ** 2 <= 12 ** 2:
-                              rgba[:3] = [242, 244, 247]
-                  row.extend(rgba)
+                  rgb=[34,40,49,255]
+                  for cx in (72,128,184):
+                      for cy in (72,128,184):
+                          if (x-cx)**2+(y-cy)**2 <= 12**2:
+                              rgb[:3]=[242,244,247]
+                  row.extend(rgb)
               rows.append(bytes(row))
-
-          png = b"\x89PNG\r\n\x1a\n"
-          png += chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 6, 0, 0, 0))
-          png += chunk(b"IDAT", zlib.compress(b"".join(rows), 9))
-          png += chunk(b"IEND", b"")
-          open(sys.argv[1], "wb").write(png)
+          png=b"\x89PNG\r\n\x1a\n"
+          png+=chunk(b"IHDR",struct.pack(">IIBBBBB",w,h,8,6,0,0,0))
+          png+=chunk(b"IDAT",zlib.compress(b"".join(rows),9))
+          png+=chunk(b"IEND",b"")
+          open(sys.argv[1],"wb").write(png)
           PY
 
           python3 -m json.tool "$PKG/manifest.json" >/dev/null
           python3 -m json.tool "$PKG/app/option.json" >/dev/null
 
-          package="$OUT/tailscale-$VERSION-ikuai.ipkg"
-          (
-            cd "$STAGE"
-            tar -czf "$package" tailscale/
-          )
-
+          package="$OUT/tailscale-${VERSION}-ikuai-docker.ipkg"
+          (cd "$STAGE" && tar -czf "$package" tailscale/)
           gzip -t "$package"
           tar -tzf "$package" >/dev/null
-          (
-            cd "$OUT"
-            sha256sum "$(basename "$package")" > SHA256SUMS
-          )
+          (cd "$OUT" && sha256sum "$(basename "$package")" > SHA256SUMS)
 
-          echo "package=$package" >> "$GITHUB_OUTPUT"
           echo "Built $package"
+          ls -lh "$package" "$PKG/docker_image.tar.gz"
           cat "$OUT/SHA256SUMS"
 
       - name: Inspect package
-        shell: bash
         env:
-          VERSION: ${{ steps.version.outputs.short }}
+          VERSION: $${{ steps.version.outputs.short }}
         run: |
           set -euo pipefail
-          tar -tzf "out/tailscale-$VERSION-ikuai.ipkg"
-          echo "== manifest =="
-          tar -xOzf "out/tailscale-$VERSION-ikuai.ipkg" tailscale/manifest.json |
-            python3 -m json.tool
+          pkg="out/tailscale-$VERSION-ikuai-docker.ipkg"
+          tar -tzf "$pkg"
+          tar -xOzf "$pkg" tailscale/manifest.json | python3 -m json.tool
+          echo "== docker-compose.yaml =="
+          tar -xOzf "$pkg" tailscale/app/docker-compose.yaml
 
-      - name: Upload package artifact
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: tailscale-${{ steps.version.outputs.short }}-ikuai
+          name: tailscale-$${{ steps.version.outputs.short }}-ikuai-docker
           path: |
             out/*.ipkg
             out/SHA256SUMS
