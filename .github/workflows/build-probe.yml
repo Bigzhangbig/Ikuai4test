@@ -6,7 +6,7 @@ on:
       probe_version:
         description: "Probe package version"
         required: true
-        default: "0.1.0"
+        default: "0.1.1"
         type: string
   push:
     branches: [main]
@@ -38,7 +38,7 @@ jobs:
         id: version
         shell: bash
         env:
-          INPUT_VERSION: ${{ inputs.probe_version || '0.1.0' }}
+          INPUT_VERSION: ${{ inputs.probe_version || '0.1.1' }}
         run: |
           set -euo pipefail
           VERSION="$INPUT_VERSION"
@@ -387,7 +387,13 @@ jobs:
           for pkg in out/*.ipkg; do
             echo "===== $pkg ====="
             tar -tzf "$pkg"
-            top="$(tar -tzf "$pkg" | head -n1 | cut -d/ -f1)"
+            top="$(python3 - "$pkg" <<'PY'
+import sys, tarfile
+with tarfile.open(sys.argv[1], "r:gz") as tf:
+    first = tf.getmembers()[0].name
+    print(first.split("/", 1)[0])
+PY
+)"
             echo "-- manifest --"
             tar -xOzf "$pkg" "$top/manifest.json" | python3 -m json.tool
             echo "-- compose --"
