@@ -6,7 +6,7 @@ on:
       probe_version:
         description: "Probe package version"
         required: true
-        default: "0.2.0"
+        default: "0.2.1"
         type: string
   push:
     branches: [main]
@@ -38,7 +38,7 @@ jobs:
         id: version
         shell: bash
         env:
-          INPUT_VERSION: ${{ inputs.probe_version || '0.2.0' }
+          INPUT_VERSION: ${{ inputs.probe_version || '0.2.1' }}
         run: |
           set -euo pipefail
           VERSION="$INPUT_VERSION"
@@ -51,7 +51,7 @@ jobs:
 
       - name: Build static probe
         env:
-          VERSION: ${{ steps.version.outputs.version }
+          VERSION: ${{ steps.version.outputs.version }}
         run: |
           set -euo pipefail
           mkdir -p dist
@@ -65,7 +65,7 @@ jobs:
 
       - name: Build offline Docker image
         env:
-          VERSION: ${{ steps.version.outputs.version }
+          VERSION: ${{ steps.version.outputs.version }}
         run: |
           set -euo pipefail
           cp dist/ikuai-cap-probe probe/ikuai-cap-probe
@@ -79,7 +79,7 @@ jobs:
 
       - name: Package iKuai bridge probe
         env:
-          VERSION: ${{ steps.version.outputs.version }
+          VERSION: ${{ steps.version.outputs.version }}
         run: |
           set -euo pipefail
           ROOT="$GITHUB_WORKSPACE"
@@ -300,7 +300,7 @@ jobs:
 
       - name: Inspect package
         env:
-          VERSION: ${{ steps.version.outputs.version }
+          VERSION: ${{ steps.version.outputs.version }}
         run: |
           set -euo pipefail
           pkg="out/ikuai-cap-probe-bridge-$VERSION.ipkg"
@@ -311,7 +311,7 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v7
         with:
-          name: ikuai-capability-probe-${{ steps.version.outputs.version }
+          name: ikuai-capability-probe-${{ steps.version.outputs.version }}
           path: |
             out/*.ipkg
             out/SHA256SUMS
