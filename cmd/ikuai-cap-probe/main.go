@@ -524,9 +524,48 @@ async function run(){
 </script>
 </body></html>`))
 
+func pushReportLoop(target string) {
+	if strings.TrimSpace(target) == "" {
+		return
+	}
+	go func() {
+		// Build the report once, then keep retrying delivery so the receiver
+		// can be started before or after the iKuai app.
+		time.Sleep(3 * time.Second)
+		report := buildReport()
+		payload, err := json.MarshalIndent(report, "", "  ")
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "report marshal failed: %v\n", err)
+			return
+		}
+		payload = append(payload, '\n')
+
+		for attempt := 1; ; attempt++ {
+			conn, err := net.DialTimeout("tcp", target, 3*time.Second)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "report push attempt %d to %s failed: %v\n", attempt, target, err)
+				time.Sleep(8 * time.Second)
+				continue
+			}
+			_ = conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+			_, err = conn.Write(payload)
+			_ = conn.Close()
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "report push attempt %d to %s write failed: %v\n", attempt, target, err)
+				time.Sleep(8 * time.Second)
+				continue
+			}
+			fmt.Printf("report pushed successfully to %s after %d attempt(s)\n", target, attempt)
+			return
+		}
+	}()
+}
+
 func main() {
 	port := getenv("PROBE_PORT", "8080")
 	mode := getenv("PROBE_MODE", "unknown")
+	reportTarget := strings.TrimSpace(os.Getenv("PROBE_REPORT_TCP"))
+	pushReportLoop(reportTarget)
 
 	http.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
@@ -545,7 +584,7 @@ func main() {
 	})
 
 	addr := "0.0.0.0:" + port
-	fmt.Printf("ikuai-cap-probe %s mode=%s listening on %s\n", version, mode, addr)
+	fmt.Printf("ikuai-cap-probe %s mode=%s listening on %s report_target=%q\n", version, mode, addr, reportTarget)
 	s := &http.Server{Addr: addr, ReadHeaderTimeout: 5 * time.Second}
 	if err := s.ListenAndServe(); err != nil {
 		fmt.Fprintln(os.Stderr, err)
