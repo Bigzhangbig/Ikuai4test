@@ -26,7 +26,7 @@ jobs:
         id: resolve
         shell: bash
         env:
-          REQUESTED_REF: $${{ inputs.tailscale_ref || 'latest' }}
+          REQUESTED_REF: ${{ inputs.tailscale_ref || 'latest' }}
         run: |
           set -euo pipefail
           if [[ "$REQUESTED_REF" == "latest" ]]; then
@@ -39,7 +39,7 @@ jobs:
 
       - name: Fetch upstream Tailscale
         env:
-          TS_REF: $${{ steps.resolve.outputs.ref }}
+          TS_REF: ${{ steps.resolve.outputs.ref }}
         run: |
           set -euo pipefail
           git init tailscale-src
@@ -77,7 +77,7 @@ jobs:
 
       - name: Build offline Docker image
         env:
-          VERSION: $${{ steps.version.outputs.short }}
+          VERSION: ${{ steps.version.outputs.short }}
         run: |
           set -euo pipefail
           mkdir -p image
@@ -116,7 +116,7 @@ jobs:
 
       - name: Package iKuai Docker app
         env:
-          VERSION: $${{ steps.version.outputs.short }}
+          VERSION: ${{ steps.version.outputs.short }}
         run: |
           set -euo pipefail
           STAGE="$GITHUB_WORKSPACE/work"
@@ -335,7 +335,7 @@ jobs:
 
       - name: Inspect package
         env:
-          VERSION: $${{ steps.version.outputs.short }}
+          VERSION: ${{ steps.version.outputs.short }}
         run: |
           set -euo pipefail
           pkg="out/tailscale-$VERSION-ikuai-docker.ipkg"
@@ -347,7 +347,7 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: tailscale-$${{ steps.version.outputs.short }}-ikuai-docker
+          name: tailscale-${{ steps.version.outputs.short }}-ikuai-docker
           path: |
             out/*.ipkg
             out/SHA256SUMS
