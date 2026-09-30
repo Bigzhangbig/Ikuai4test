@@ -1,0 +1,405 @@
+name: Build iKuai Capability Probe
+
+on:
+  workflow_dispatch:
+    inputs:
+      probe_version:
+        description: "Probe package version"
+        required: true
+        default: "0.1.0"
+        type: string
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/build-probe.yml"
+      - "cmd/ikuai-cap-probe/**"
+      - "probe/**"
+      - "go.mod"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: "1.26.x"
+          cache: false
+
+      - name: Resolve package version
+        id: version
+        shell: bash
+        env:
+          INPUT_VERSION: ${{ inputs.probe_version || '0.1.0' }
+        run: |
+          set -euo pipefail
+          VERSION="$INPUT_VERSION"
+          if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][A-Za-z0-9._-]+)?$ ]]; then
+            echo "Invalid version: $VERSION" >&2
+            exit 2
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Probe version: $VERSION"
+
+      - name: Build static probe
+        env:
+          VERSION: ${{ steps.version.outputs.version }
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+            go build -trimpath \
+            -ldflags="-s -w -X main.version=$VERSION" \
+            -o dist/ikuai-cap-probe \
+            ./cmd/ikuai-cap-probe
+
+          file dist/ikuai-cap-probe
+          go version -m dist/ikuai-cap-probe
+
+      - name: Build offline Docker image
+        env:
+          VERSION: ${{ steps.version.outputs.version }
+        run: |
+          set -euo pipefail
+          cp dist/ikuai-cap-probe probe/ikuai-cap-probe
+          docker build \
+            --platform linux/amd64 \
+            -t "ikuai-cap-probe:$VERSION" \
+            probe
+          rm -f probe/ikuai-cap-probe
+
+          docker image inspect "ikuai-cap-probe:$VERSION" \
+            --format 'image={{.RepoTags}} os={{.Os}} arch={{.Architecture}}'
+
+          mkdir -p work
+          docker save "ikuai-cap-probe:$VERSION" | gzip -9 > work/docker_image.tar.gz
+          gzip -t work/docker_image.tar.gz
+          ls -lh work/docker_image.tar.gz
+
+      - name: Build bridge and host iKuai packages
+        id: package
+        env:
+          VERSION: ${{ steps.version.outputs.version }
+        shell: bash
+        run: |
+          set -euo pipefail
+          ROOT="$GITHUB_WORKSPACE"
+          OUT="$ROOT/out"
+          IMAGE_TAR="$ROOT/work/docker_image.tar.gz"
+          rm -rf "$OUT"
+          mkdir -p "$OUT"
+
+          make_icon() {
+            python3 - "$1" <<'PY'
+          import binascii, struct, sys, zlib
+          w=h=256
+          def chunk(k,d):
+              return struct.pack(">I",len(d))+k+d+struct.pack(">I",binascii.crc32(k+d)&0xffffffff)
+          rows=[]
+          for y in range(h):
+              row=bytearray([0])
+              for x in range(w):
+                  rgba=[34,40,49,255]
+                  dx=x-128; dy=y-128
+                  if dx*dx+dy*dy < 86*86:
+                      rgba=[67,97,238,255]
+                  if abs(dx) < 8 or abs(dy) < 8:
+                      if dx*dx+dy*dy < 62*62:
+                          rgba=[245,247,250,255]
+                  row.extend(rgba)
+              rows.append(bytes(row))
+          png=b"\x89PNG\r\n\x1a\n"
+          png+=chunk(b"IHDR",struct.pack(">IIBBBBB",w,h,8,6,0,0,0))
+          png+=chunk(b"IDAT",zlib.compress(b"".join(rows),9))
+          png+=chunk(b"IEND",b"")
+          open(sys.argv[1],"wb").write(png)
+          PY
+          }
+
+          write_common() {
+            local PKG="$1"
+            local NAME="$2"
+            local DISPLAY="$3"
+
+            mkdir -p "$PKG/app" "$PKG/ui/ico"
+            cp "$IMAGE_TAR" "$PKG/docker_image.tar.gz"
+            make_icon "$PKG/ui/ico/app.png"
+
+            cat > "$PKG/manifest.json" <<EOF
+          {
+            "name": "$NAME",
+            "version": "$VERSION",
+            "display_name": "$DISPLAY",
+            "image": "ikuai-cap-probe:$VERSION",
+            "description": "Standalone iKuai 4.0 Docker capability and network probe",
+            "type": "1",
+            "maintainer": "Bigzhangbig",
+            "maintainer_url": "https://github.com/Bigzhangbig/Ikuai4test",
+            "distributor": "Bigzhangbig",
+            "distributor_url": "https://github.com/Bigzhangbig/Ikuai4test",
+            "requirements": {
+              "memory": "64MB",
+              "storage": "64MB",
+              "os_min_version": "4.0.0"
+            }
+          }
+          EOF
+
+            cat > "$PKG/app/environment" <<'EOF'
+          # Reserved for future advanced probe variables.
+          EOF
+
+            cat > "$PKG/app/option.json" <<'EOF'
+          [
+            {
+              "default": 18080,
+              "attrname": "APP_PORT_WEB",
+              "label": {"en": "Probe Web port", "zh": "探针 Web 端口"},
+              "required": true,
+              "scope": "config",
+              "type": "integer",
+              "min": 1,
+              "max": 65535
+            },
+            {
+              "default": "",
+              "attrname": "PROBE_TARGETS",
+              "label": {"en": "LAN TCP targets", "zh": "LAN TCP 测试目标"},
+              "required": false,
+              "scope": "config",
+              "type": "text",
+              "min": 0,
+              "max": 2048,
+              "description": {"zh": "可填写多个 host:port，用逗号分隔。例如 192.168.1.1:80,192.168.1.10:443。只做 TCP connect 测试。"}
+            },
+            {
+              "default": "www.qq.com",
+              "attrname": "PROBE_DNS_NAME",
+              "label": {"en": "DNS test name", "zh": "DNS 测试域名"},
+              "required": true,
+              "scope": "config",
+              "type": "text",
+              "min": 1,
+              "max": 253
+            },
+            {
+              "default": "223.5.5.5:53,1.1.1.1:443",
+              "attrname": "PROBE_TCP_TARGETS",
+              "label": {"en": "External TCP targets", "zh": "外网 TCP 测试目标"},
+              "required": true,
+              "scope": "config",
+              "type": "text",
+              "min": 1,
+              "max": 2048
+            }
+          ]
+          EOF
+          }
+
+          # Bridge-mode package.
+          BRIDGE_ROOT="$ROOT/stage-bridge"
+          BRIDGE="$BRIDGE_ROOT/ikuai-cap-probe-bridge"
+          rm -rf "$BRIDGE_ROOT"
+          write_common "$BRIDGE" "ikuai-cap-probe-bridge" "iKuai 能力探针 (Bridge)"
+
+          cat > "$BRIDGE/app/.env" <<'EOF'
+          CPUS_LIMIT=0
+          MEMORY_LIMIT=0
+          HOST_IP=0.0.0.0
+          RESTART=always
+          APP_PORT_WEB=18080
+          PROBE_TARGETS=
+          PROBE_DNS_NAME=www.qq.com
+          PROBE_TCP_TARGETS=223.5.5.5:53,1.1.1.1:443
+          EOF
+
+          cat > "$BRIDGE/app/docker-compose.yaml" <<'EOF'
+          services:
+            probe:
+              image: ikuai-cap-probe:__VERSION__
+              container_name: ikuai-cap-probe-bridge-${NAME_NONCE}
+              deploy:
+                resources:
+                  limits:
+                    cpus: ${CPUS_LIMIT}
+                    memory: ${MEMORY_LIMIT}
+              restart: ${RESTART}
+              cap_add:
+                - NET_ADMIN
+                - NET_RAW
+              device_cgroup_rules:
+                - 'c 10:200 rwm'
+              ports:
+                - ${HOST_IP}:${APP_PORT_WEB}:8080/tcp
+              environment:
+                PROBE_MODE: bridge
+                PROBE_PORT: "8080"
+                PROBE_TARGETS: ${PROBE_TARGETS}
+                PROBE_DNS_NAME: ${PROBE_DNS_NAME}
+                PROBE_TCP_TARGETS: ${PROBE_TCP_TARGETS}
+              env_file:
+                - ./environment
+              logging:
+                driver: json-file
+                options:
+                  max-size: "10m"
+                  max-file: "3"
+              networks:
+                - doc_app_default
+              labels:
+                createdBy: "iKuai Capability Probe"
+          networks:
+            doc_app_default:
+              external: true
+              name: doc_app_default
+          EOF
+          sed -i "s/__VERSION__/$VERSION/g" "$BRIDGE/app/docker-compose.yaml"
+
+          cat > "$BRIDGE/readme" <<'EOF'
+          Bridge 模式能力探针。
+
+          安装后浏览器访问：
+          http://<iKuai LAN IP>:<探针 Web 端口>/
+
+          默认端口 18080。
+
+          该版本专门测试 doc_app_default 下：
+          - 容器接口/路由/默认网关
+          - DNS 与外网 TCP
+          - 到指定 LAN host:port 的可达性
+          - TUN
+          - NET_ADMIN / NET_RAW
+          - IPv4 forwarding sysctl 是否可写
+          - iptables / nftables 可见性
+          - UPnP SSDP / NAT-PMP / PCP
+
+          PROBE_TARGETS 建议填写你明确知道存在的 LAN 服务，例如：
+          192.168.1.1:80,192.168.1.10:443
+          EOF
+
+          # Host-mode package.
+          HOST_ROOT="$ROOT/stage-host"
+          HOST="$HOST_ROOT/ikuai-cap-probe-host"
+          rm -rf "$HOST_ROOT"
+          write_common "$HOST" "ikuai-cap-probe-host" "iKuai 能力探针 (Host)"
+
+          # Different default port so both variants could coexist if iKuai accepts host mode.
+          sed -i 's/"default": 18080/"default": 18081/' "$HOST/app/option.json"
+
+          cat > "$HOST/app/.env" <<'EOF'
+          CPUS_LIMIT=0
+          MEMORY_LIMIT=0
+          RESTART=always
+          APP_PORT_WEB=18081
+          PROBE_TARGETS=
+          PROBE_DNS_NAME=www.qq.com
+          PROBE_TCP_TARGETS=223.5.5.5:53,1.1.1.1:443
+          EOF
+
+          cat > "$HOST/app/docker-compose.yaml" <<'EOF'
+          services:
+            probe:
+              image: ikuai-cap-probe:__VERSION__
+              container_name: ikuai-cap-probe-host-${NAME_NONCE}
+              deploy:
+                resources:
+                  limits:
+                    cpus: ${CPUS_LIMIT}
+                    memory: ${MEMORY_LIMIT}
+              restart: ${RESTART}
+              network_mode: host
+              cap_add:
+                - NET_ADMIN
+                - NET_RAW
+              device_cgroup_rules:
+                - 'c 10:200 rwm'
+              environment:
+                PROBE_MODE: host
+                PROBE_PORT: ${APP_PORT_WEB}
+                PROBE_TARGETS: ${PROBE_TARGETS}
+                PROBE_DNS_NAME: ${PROBE_DNS_NAME}
+                PROBE_TCP_TARGETS: ${PROBE_TCP_TARGETS}
+              env_file:
+                - ./environment
+              logging:
+                driver: json-file
+                options:
+                  max-size: "10m"
+                  max-file: "3"
+              labels:
+                createdBy: "iKuai Capability Probe"
+          EOF
+          sed -i "s/__VERSION__/$VERSION/g" "$HOST/app/docker-compose.yaml"
+
+          cat > "$HOST/readme" <<'EOF'
+          Host 模式能力探针。
+
+          这是有意设计的兼容性实验：
+          docker-compose.yaml 使用 network_mode: host。
+
+          如果 iKuai 安装器直接拒绝、Compose 创建失败或容器无法启动，请记录完整报错；
+          这本身即可证明当前 App Market 本地安装路径对 host networking 的支持边界。
+
+          如果能够启动，访问：
+          http://<iKuai LAN IP>:18081/
+
+          再与 Bridge 版报告中的 interfaces、ip_route、default_gateway、UPnP/PCP 结果对比。
+          EOF
+
+          python3 -m json.tool "$BRIDGE/manifest.json" >/dev/null
+          python3 -m json.tool "$BRIDGE/app/option.json" >/dev/null
+          python3 -m json.tool "$HOST/manifest.json" >/dev/null
+          python3 -m json.tool "$HOST/app/option.json" >/dev/null
+
+          echo "== Validate bridge Compose =="
+          (cd "$BRIDGE/app" && docker compose --env-file .env -f docker-compose.yaml config >/dev/null)
+          echo "== Validate host Compose =="
+          (cd "$HOST/app" && docker compose --env-file .env -f docker-compose.yaml config >/dev/null)
+
+          BRIDGE_OUT="$OUT/ikuai-cap-probe-bridge-$VERSION.ipkg"
+          HOST_OUT="$OUT/ikuai-cap-probe-host-$VERSION.ipkg"
+
+          (cd "$BRIDGE_ROOT" && tar -czf "$BRIDGE_OUT" ikuai-cap-probe-bridge/)
+          (cd "$HOST_ROOT" && tar -czf "$HOST_OUT" ikuai-cap-probe-host/)
+
+          gzip -t "$BRIDGE_OUT"
+          gzip -t "$HOST_OUT"
+          tar -tzf "$BRIDGE_OUT" >/dev/null
+          tar -tzf "$HOST_OUT" >/dev/null
+
+          (cd "$OUT" && sha256sum *.ipkg > SHA256SUMS)
+          cat "$OUT/SHA256SUMS"
+          ls -lh "$OUT"/*.ipkg
+
+      - name: Inspect packages
+        env:
+          VERSION: ${{ steps.version.outputs.version }
+        run: |
+          set -euo pipefail
+          for pkg in out/*.ipkg; do
+            echo "===== $pkg ====="
+            tar -tzf "$pkg"
+            top="$(tar -tzf "$pkg" | head -n1 | cut -d/ -f1)"
+            echo "-- manifest --"
+            tar -xOzf "$pkg" "$top/manifest.json" | python3 -m json.tool
+            echo "-- compose --"
+            tar -xOzf "$pkg" "$top/app/docker-compose.yaml"
+          done
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: ikuai-capability-probe-${{ steps.version.outputs.version }
+          path: |
+            out/*.ipkg
+            out/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 30
